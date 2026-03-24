@@ -505,6 +505,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-epoch",
  "crossbeam-skiplist",
+ "equivalent",
  "farmhash",
  "moka",
  "nom",

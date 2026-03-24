@@ -34,23 +34,62 @@ pub struct BlockBuilder {
 impl BlockBuilder {
     /// Creates a new block builder.
     pub fn new(block_size: usize) -> Self {
-        unimplemented!()
+        Self {
+            offsets: Vec::new(),
+            data: Vec::new(),
+            block_size,
+            first_key: KeyVec::default(),
+        }
     }
 
     /// Adds a key-value pair to the block. Returns false when the block is full.
     /// You may find the `bytes::BufMut` trait useful for manipulating binary data.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        unimplemented!()
+        // size of the new entry: key_len(2) + key + val_len(2) + val
+        let entry_size = 2 + key.len() + 2 + value.len();
+
+        // size of one new offset entry: 2 bytes
+        // size of num_of_elements footer: 2 bytes
+        let new_size = self.data.len()           // existing data
+        + entry_size                         // new entry
+        + (self.offsets.len() + 1) * 2      // existing + new offset
+        + 2; // num_of_elements
+
+        // reject if over size limit, UNLESS this is the very first entry
+        if new_size > self.block_size && !self.is_empty() {
+            return false;
+        }
+
+        // record the offset of this new entry (= current end of data)
+        self.offsets.push(self.data.len() as u16);
+
+        // write key_len + key + val_len + val into data
+        self.data
+            .extend_from_slice(&(key.len() as u16).to_le_bytes());
+        self.data.extend_from_slice(key.raw_ref());
+        self.data
+            .extend_from_slice(&(value.len() as u16).to_le_bytes());
+        self.data.extend_from_slice(value);
+
+        // track first key
+        if self.first_key.is_empty() {
+            self.first_key = key.to_key_vec();
+        }
+
+        true
     }
 
     /// Check if there is no key-value pair in the block.
     pub fn is_empty(&self) -> bool {
-        unimplemented!()
+        self.data.is_empty()
     }
 
     /// Finalize the block.
     pub fn build(self) -> Block {
-        unimplemented!()
+        Block {
+            data: self.data,
+            offsets: self.offsets,
+        }
     }
 }
