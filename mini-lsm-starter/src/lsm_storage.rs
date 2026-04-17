@@ -38,7 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, map_bound};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -86,6 +86,33 @@ impl LsmStorageState {
 
 fn key_within(user_key: &[u8], table_begin: KeySlice, table_end: KeySlice) -> bool {
     table_begin.raw_ref() <= user_key && user_key <= table_end.raw_ref()
+}
+
+fn range_overlap(
+    user_begin: Bound<&[u8]>,
+    user_end: Bound<&[u8]>,
+    table_begin: KeySlice,
+    table_end: KeySlice,
+) -> bool {
+    match user_end {
+        Bound::Excluded(key) if key <= table_begin.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key < table_begin.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    match user_begin {
+        Bound::Excluded(key) if key >= table_end.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key > table_end.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -264,6 +291,9 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        if !path.exists() {
+            std::fs::create_dir_all(path)?;
+        }
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -360,17 +390,30 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
-            // freeze the current memtable and create a new one
-            self.force_freeze_memtable(&self.state_lock.lock())?;
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put(_key, _value)?;
+            size = guard.memtable.approximate_size();
         }
-
-        self.state.read().memtable.put(_key, _value)
+        self.try_freeze(size)
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
         self.put(_key, b"")
+    }
+
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        if estimated_size >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let guard = self.state.read();
+            if guard.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(guard);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -409,7 +452,42 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+        let flush_memtable = {
+            let guard = self.state.read();
+            guard
+                .imm_memtables
+                .last()
+                .expect("no imm memtables!")
+                .clone()
+        };
+
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        flush_memtable.flush(&mut builder)?;
+        let sst_id = flush_memtable.id();
+        let sst = Arc::new(builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?);
+
+        // Add the flushed L0 table to the list.
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            // Remove the memtable from the immutable memtables.
+            let mem = snapshot.imm_memtables.pop().unwrap();
+            assert_eq!(mem.id(), sst_id);
+            if self.compaction_controller.flush_to_l0() {
+                snapshot.l0_sstables.insert(0, sst_id);
+            } else {
+                snapshot.levels.insert(0, (sst_id, vec![sst_id]));
+            }
+            snapshot.sstables.insert(sst_id, sst);
+            *guard = Arc::new(snapshot);
+        }
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -439,6 +517,14 @@ impl LsmStorageInner {
         let mut table_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for table_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables[table_id].clone();
+            if !range_overlap(
+                _lower,
+                _upper,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                continue;
+            }
             let iter = match _lower {
                 Bound::Included(key) => {
                     SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(key))?
