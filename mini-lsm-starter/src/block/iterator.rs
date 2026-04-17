@@ -15,8 +15,9 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use equivalent::Comparable;
 use std::sync::Arc;
+
+use bytes::Buf;
 
 use crate::key::{KeySlice, KeyVec};
 
@@ -36,14 +37,27 @@ pub struct BlockIterator {
     first_key: KeyVec,
 }
 
+const SIZEOF_U16: usize = std::mem::size_of::<u16>();
+
+impl Block {
+    fn get_first_key(&self) -> KeyVec {
+        let mut buf = &self.data[..];
+        buf.get_u16();
+        let key_len = buf.get_u16();
+        let key = &buf[..key_len as usize];
+        KeyVec::from_vec(key.to_vec())
+    }
+}
+
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
+        let first_key = block.get_first_key();
         Self {
             block,
             key: KeyVec::new(),
             value_range: (0, 0),
             idx: 0,
-            first_key: KeyVec::new(),
+            first_key,
         }
     }
 
@@ -89,11 +103,13 @@ impl BlockIterator {
 
     /// Returns the key of the current entry.
     pub fn key(&self) -> KeySlice<'_> {
+        debug_assert!(!self.key.is_empty(), "invalid iterator");
         self.key.as_key_slice()
     }
 
     /// Returns the value of the current entry.
     pub fn value(&self) -> &[u8] {
+        debug_assert!(!self.key.is_empty(), "invalid iterator");
         &self.block.data[self.value_range.0..self.value_range.1]
     }
 
@@ -105,32 +121,60 @@ impl BlockIterator {
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        self.seek_to_idx(0);
-        self.first_key = self.key.clone();
+        self.seek_to(0);
     }
 
     /// Move to the next key in the block.
     pub fn next(&mut self) {
-        self.seek_to_idx(self.idx + 1);
+        self.idx += 1;
+        self.seek_to(self.idx);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        // binary search over the offsets using the key at each index
-        let mut lo = 0;
-        let mut hi = self.block.offsets.len();
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            self.seek_to_idx(mid);
-            match self.key().compare(&key) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                _ => hi = mid,
+        let mut low = 0;
+        let mut high = self.block.offsets.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            self.seek_to(mid);
+            assert!(self.is_valid());
+            match self.key().cmp(&key) {
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => high = mid,
+                std::cmp::Ordering::Equal => return,
             }
         }
+        self.seek_to(low);
+    }
 
-        self.seek_to_idx(lo);
+    /// Seeks to the idx-th key in the block.
+    fn seek_to(&mut self, idx: usize) {
+        if idx >= self.block.offsets.len() {
+            self.key.clear();
+            self.value_range = (0, 0);
+            return;
+        }
+        let offset = self.block.offsets[idx] as usize;
+        self.seek_to_offset(offset);
+        self.idx = idx;
+    }
+
+    /// Seek to the specified position and update the current `key` and `value`
+    fn seek_to_offset(&mut self, offset: usize) {
+        let mut entry = &self.block.data[offset..];
+        let overlap_len = entry.get_u16() as usize;
+        let key_len = entry.get_u16() as usize;
+        let key = &entry[..key_len];
+        self.key.clear();
+        self.key.append(&self.first_key.raw_ref()[..overlap_len]);
+        self.key.append(key);
+        entry.advance(key_len);
+        let value_len = entry.get_u16() as usize;
+        let value_offset_begin = offset + SIZEOF_U16 + SIZEOF_U16 + key_len + SIZEOF_U16;
+        let value_offset_end = value_offset_begin + value_len;
+        self.value_range = (value_offset_begin, value_offset_end);
+        entry.advance(value_len);
     }
 }

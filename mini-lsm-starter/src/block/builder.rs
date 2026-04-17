@@ -15,6 +15,8 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use bytes::BufMut;
+
 use crate::key::{KeySlice, KeyVec};
 
 use super::Block;
@@ -31,6 +33,22 @@ pub struct BlockBuilder {
     first_key: KeyVec,
 }
 
+const SIZEOF_U16: usize = std::mem::size_of::<u16>();
+
+fn compute_overlap(first_key: KeySlice, key: KeySlice) -> usize {
+    let mut i = 0;
+    loop {
+        if i >= first_key.len() || i >= key.len() {
+            break;
+        }
+        if first_key.raw_ref()[i] != key.raw_ref()[i] {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
 impl BlockBuilder {
     /// Creates a new block builder.
     pub fn new(block_size: usize) -> Self {
@@ -38,41 +56,33 @@ impl BlockBuilder {
             offsets: Vec::new(),
             data: Vec::new(),
             block_size,
-            first_key: KeyVec::default(),
+            first_key: KeyVec::new(),
         }
+    }
+
+    fn estimated_size(&self) -> usize {
+        SIZEOF_U16 + self.offsets.len() * SIZEOF_U16 + self.data.len()
     }
 
     /// Adds a key-value pair to the block. Returns false when the block is full.
     /// You may find the `bytes::BufMut` trait useful for manipulating binary data.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        // size of the new entry: key_len(2) + key + val_len(2) + val
-        let entry_size = 2 + key.len() + 2 + value.len();
-
-        // size of one new offset entry: 2 bytes
-        // size of num_of_elements footer: 2 bytes
-        let new_size = self.data.len()           // existing data
-        + entry_size                         // new entry
-        + (self.offsets.len() + 1) * 2      // existing + new offset
-        + 2; // num_of_elements
-
-        // reject if over size limit, UNLESS this is the very first entry
-        if new_size > self.block_size && !self.is_empty() {
+        assert!(!key.is_empty(), "key must not be empty");
+        if self.estimated_size() + key.len() + value.len() + SIZEOF_U16 * 3 > self.block_size
+            && !self.is_empty()
+        {
             return false;
         }
 
-        // record the offset of this new entry (= current end of data)
         self.offsets.push(self.data.len() as u16);
+        let overlap = compute_overlap(self.first_key.as_key_slice(), key);
+        self.data.put_u16(overlap as u16);
+        self.data.put_u16((key.len() - overlap) as u16);
+        self.data.put(&key.raw_ref()[overlap..]);
+        self.data.put_u16(value.len() as u16);
+        self.data.put(value);
 
-        // write key_len + key + val_len + val into data
-        self.data
-            .extend_from_slice(&(key.len() as u16).to_le_bytes());
-        self.data.extend_from_slice(key.raw_ref());
-        self.data
-            .extend_from_slice(&(value.len() as u16).to_le_bytes());
-        self.data.extend_from_slice(value);
-
-        // track first key
         if self.first_key.is_empty() {
             self.first_key = key.to_key_vec();
         }
@@ -82,11 +92,14 @@ impl BlockBuilder {
 
     /// Check if there is no key-value pair in the block.
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.offsets.is_empty()
     }
 
     /// Finalize the block.
     pub fn build(self) -> Block {
+        if self.is_empty() {
+            panic!("block should not be empty");
+        }
         Block {
             data: self.data,
             offsets: self.offsets,

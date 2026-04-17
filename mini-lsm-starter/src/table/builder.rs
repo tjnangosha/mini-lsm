@@ -21,6 +21,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::BufMut;
 
+use super::bloom::Bloom;
 use super::{BlockMeta, SsTable};
 use crate::{
     block::BlockBuilder,
@@ -37,6 +38,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>, // data blocks
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -49,6 +51,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -60,6 +63,8 @@ impl SsTableBuilder {
         if self.first_key.is_empty() {
             self.first_key.set_from_slice(key);
         }
+
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
 
         let success = self.builder.add(key, value);
 
@@ -74,6 +79,7 @@ impl SsTableBuilder {
 
         // prepare it for adding to the data vec
         let block_raw = block.encode();
+        let checksum = crc32fast::hash(&block_raw);
 
         // prepare the block meta for this outgoing block and take record of it
         let block_meta = BlockMeta {
@@ -85,6 +91,7 @@ impl SsTableBuilder {
 
         // add it to the data blocks
         self.data.extend_from_slice(&block_raw);
+        self.data.put_u32(checksum);
 
         // now we can add the new key-value pair to the new block builder
         assert!(self.builder.add(key, value));
@@ -109,6 +116,7 @@ impl SsTableBuilder {
         let builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
         let block = builder.build();
         let block_raw = block.encode();
+        let checksum = crc32fast::hash(&block_raw);
 
         let block_meta = BlockMeta {
             offset: self.data.len(),
@@ -118,6 +126,7 @@ impl SsTableBuilder {
         self.meta.push(block_meta);
 
         self.data.extend_from_slice(&block_raw);
+        self.data.put_u32(checksum);
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
@@ -133,6 +142,13 @@ impl SsTableBuilder {
         let block_meta_offset = buf.len();
         BlockMeta::encode_block_meta(&self.meta, &mut buf);
         buf.put_u32(block_meta_offset as u32);
+        let bloom = Bloom::build_from_key_hashes(
+            &self.key_hashes,
+            Bloom::bloom_bits_per_key(self.key_hashes.len(), 0.01),
+        );
+        let bloom_offset = buf.len();
+        bloom.encode(&mut buf);
+        buf.put_u32(bloom_offset as u32);
         let first_key = self.meta.first().unwrap().first_key.clone();
         let last_key = self.meta.last().unwrap().last_key.clone();
 
@@ -144,7 +160,7 @@ impl SsTableBuilder {
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         };
 
