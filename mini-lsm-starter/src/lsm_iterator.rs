@@ -18,14 +18,17 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::mem_table::MemTableIterator;
 use crate::table::SsTableIterator;
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner =
-    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
+type LsmIteratorInner = TwoMergeIterator<
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
+    MergeIterator<SstConcatIterator>,
+>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
@@ -34,7 +37,6 @@ pub struct LsmIterator {
 }
 
 impl LsmIterator {
-    #[allow(dead_code)]
     pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
         let mut iter = Self {
             is_valid: iter.is_valid(),
@@ -135,6 +137,7 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     }
 
     fn next(&mut self) -> Result<()> {
+        // only move when the iterator is valid and not errored
         if self.has_errored {
             bail!("the iterator is tainted");
         }

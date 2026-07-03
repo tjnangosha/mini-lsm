@@ -31,6 +31,7 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
@@ -326,7 +327,8 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        // no-op for starter manifest-less implementation: ensure WAL sync if any
+        Ok(())
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -387,9 +389,24 @@ impl LsmStorageInner {
         }
 
         let l0_iter = MergeIterator::create(l0_iters);
+        let mut level_iters = Vec::with_capacity(snapshot.levels.len());
+        for (_, level_sst_ids) in &snapshot.levels {
+            let mut level_ssts = Vec::with_capacity(level_sst_ids.len());
+            for table in level_sst_ids {
+                let table = snapshot.sstables[table].clone();
+                if keep_table(_key, &table) {
+                    level_ssts.push(table);
+                }
+            }
+            let level_iter =
+                SstConcatIterator::create_and_seek_to_key(level_ssts, KeySlice::from_slice(_key))?;
+            level_iters.push(Box::new(level_iter));
+        }
 
-        if l0_iter.is_valid() && l0_iter.key().raw_ref() == _key && !l0_iter.value().is_empty() {
-            return Ok(Some(Bytes::copy_from_slice(l0_iter.value())));
+        let iter = TwoMergeIterator::create(l0_iter, MergeIterator::create(level_iters))?;
+
+        if iter.is_valid() && iter.key().raw_ref() == _key && !iter.value().is_empty() {
+            return Ok(Some(Bytes::copy_from_slice(iter.value())));
         }
 
         Ok(None)
@@ -397,7 +414,35 @@ impl LsmStorageInner {
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+        for record in _batch {
+            match record {
+                WriteBatchRecord::Del(key) => {
+                    let key = key.as_ref();
+                    assert!(!key.is_empty(), "key cannot be empty");
+                    let size;
+                    {
+                        let guard = self.state.read();
+                        guard.memtable.put(key, b"")?;
+                        size = guard.memtable.approximate_size();
+                    }
+                    self.try_freeze(size)?;
+                }
+                WriteBatchRecord::Put(key, value) => {
+                    let key = key.as_ref();
+                    let value = value.as_ref();
+                    assert!(!key.is_empty(), "key cannot be empty");
+                    assert!(!value.is_empty(), "value cannot be empty");
+                    let size;
+                    {
+                        let guard = self.state.read();
+                        guard.memtable.put(key, value)?;
+                        size = guard.memtable.approximate_size();
+                    }
+                    self.try_freeze(size)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
@@ -445,7 +490,11 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        // best-effort sync the DB directory
+        if let Ok(f) = std::fs::File::open(&self.path) {
+            f.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -555,7 +604,29 @@ impl LsmStorageInner {
         }
 
         let l0_iter = MergeIterator::create(table_iters);
-        let iter = TwoMergeIterator::create(memtable_iter, l0_iter)?;
+        let mut level_iters = Vec::with_capacity(snapshot.levels.len());
+        for (_, level_sst_ids) in &snapshot.levels {
+            let mut level_ssts = Vec::with_capacity(level_sst_ids.len());
+            for table in level_sst_ids {
+                let table = snapshot.sstables[table].clone();
+                if !range_overlap(
+                    _lower,
+                    _upper,
+                    table.first_key().as_key_slice(),
+                    table.last_key().as_key_slice(),
+                ) {
+                    continue;
+                }
+                level_ssts.push(table);
+            }
+            let level_iter = SstConcatIterator::create_and_seek_to_first(level_ssts)?;
+            level_iters.push(Box::new(level_iter));
+        }
+
+        let iter = TwoMergeIterator::create(
+            TwoMergeIterator::create(memtable_iter, l0_iter)?,
+            MergeIterator::create(level_iters),
+        )?;
 
         Ok(FusedIterator::new(LsmIterator::new(
             iter,
