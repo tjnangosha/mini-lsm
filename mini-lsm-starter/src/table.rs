@@ -50,6 +50,7 @@ impl BlockMeta {
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
     pub fn encode_block_meta(
         block_meta: &[BlockMeta],
+        max_ts: u64,
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
@@ -57,47 +58,54 @@ impl BlockMeta {
         for meta in block_meta {
             estimated_size += std::mem::size_of::<u32>();
             estimated_size += std::mem::size_of::<u16>();
-            estimated_size += meta.first_key.len();
+            estimated_size += meta.first_key.raw_len();
             estimated_size += std::mem::size_of::<u16>();
-            estimated_size += meta.last_key.len();
+            estimated_size += meta.last_key.raw_len();
         }
+        estimated_size += std::mem::size_of::<u64>();
         estimated_size += std::mem::size_of::<u32>();
         buf.reserve(estimated_size);
         let original_len = buf.len();
         buf.put_u32(block_meta.len() as u32);
         for meta in block_meta {
             buf.put_u32(meta.offset as u32);
-            buf.put_u16(meta.first_key.len() as u16);
-            buf.put_slice(meta.first_key.raw_ref());
-            buf.put_u16(meta.last_key.len() as u16);
-            buf.put_slice(meta.last_key.raw_ref());
+            buf.put_u16(meta.first_key.key_len() as u16);
+            buf.put_slice(meta.first_key.key_ref());
+            buf.put_u64(meta.first_key.ts());
+            buf.put_u16(meta.last_key.key_len() as u16);
+            buf.put_slice(meta.last_key.key_ref());
+            buf.put_u64(meta.last_key.ts());
         }
+        buf.put_u64(max_ts);
         buf.put_u32(crc32fast::hash(&buf[original_len + 4..]));
         assert_eq!(estimated_size, buf.len() - original_len);
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: &[u8]) -> Result<Vec<BlockMeta>> {
+    pub fn decode_block_meta(mut buf: &[u8]) -> Result<(Vec<BlockMeta>, u64)> {
         let mut block_meta = Vec::new();
         let num = buf.get_u32() as usize;
         let checksum = crc32fast::hash(&buf[..buf.remaining() - 4]);
         for _ in 0..num {
             let offset = buf.get_u32() as usize;
             let first_key_len = buf.get_u16() as usize;
-            let first_key = KeyBytes::from_bytes(buf.copy_to_bytes(first_key_len));
+            let first_key =
+                KeyBytes::from_bytes_with_ts(buf.copy_to_bytes(first_key_len), buf.get_u64());
             let last_key_len = buf.get_u16() as usize;
-            let last_key = KeyBytes::from_bytes(buf.copy_to_bytes(last_key_len));
+            let last_key =
+                KeyBytes::from_bytes_with_ts(buf.copy_to_bytes(last_key_len), buf.get_u64());
             block_meta.push(BlockMeta {
                 offset,
                 first_key,
                 last_key,
             });
         }
+        let max_ts = buf.get_u64();
         if buf.get_u32() != checksum {
             bail!("meta checksum mismatched");
         }
 
-        Ok(block_meta)
+        Ok((block_meta, max_ts))
     }
 }
 
@@ -169,7 +177,7 @@ impl SsTable {
         let raw_meta_offset = file.read(bloom_offset - 4, 4)?;
         let block_meta_offset = (&raw_meta_offset[..]).get_u32() as u64;
         let raw_meta = file.read(block_meta_offset, bloom_offset - 4 - block_meta_offset)?;
-        let block_meta = BlockMeta::decode_block_meta(&raw_meta[..])?;
+        let (block_meta, max_ts) = BlockMeta::decode_block_meta(&raw_meta[..])?;
         Ok(Self {
             file,
             block_meta_offset: block_meta_offset as usize,
@@ -179,7 +187,7 @@ impl SsTable {
             last_key: block_meta.last().unwrap().last_key.clone(),
             block_meta,
             bloom: Some(bloom_filter),
-            max_ts: 0,
+            max_ts,
         })
     }
 

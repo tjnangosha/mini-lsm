@@ -19,7 +19,10 @@ use std::sync::Arc;
 
 use bytes::Buf;
 
-use crate::key::{KeySlice, KeyVec};
+use crate::{
+    block::SIZEOF_U16,
+    key::{KeySlice, KeyVec},
+};
 
 use super::Block;
 
@@ -37,15 +40,14 @@ pub struct BlockIterator {
     first_key: KeyVec,
 }
 
-const SIZEOF_U16: usize = std::mem::size_of::<u16>();
-
 impl Block {
     fn get_first_key(&self) -> KeyVec {
         let mut buf = &self.data[..];
         buf.get_u16();
-        let key_len = buf.get_u16();
-        let key = &buf[..key_len as usize];
-        KeyVec::from_vec(key.to_vec())
+        let key_len = buf.get_u16() as usize;
+        let key = &buf[..key_len];
+        buf.advance(key_len);
+        KeyVec::from_vec_with_ts(key.to_vec(), buf.get_u64())
     }
 }
 
@@ -59,32 +61,6 @@ impl BlockIterator {
             idx: 0,
             first_key,
         }
-    }
-
-    fn seek_to_idx(&mut self, idx: usize) {
-        // if idx is out of bounds, mark iterator as invalid by clearing the key
-        if idx >= self.block.offsets.len() {
-            self.key.clear();
-            return;
-        }
-
-        self.idx = idx;
-        let offset = self.block.offsets[idx] as usize;
-        let data = &self.block.data;
-
-        // parse key_len (2 bytes) at offset
-        let key_len = u16::from_le_bytes([data[offset], data[offset + 1]]) as usize;
-        let key_start = offset + 2;
-        let key_end = key_start + key_len;
-
-        // parse val_len (2 bytes) right after the key
-        let val_len = u16::from_le_bytes([data[key_end], data[key_end + 1]]) as usize;
-        let val_start = key_end + 2;
-        let val_end = val_start + val_len;
-
-        // store key (copied, as per spec) and value range (not copied)
-        self.key = KeyVec::from_vec(data[key_start..key_end].to_vec());
-        self.value_range = (val_start, val_end);
     }
 
     /// Creates a block iterator and seek to the first entry.
@@ -168,11 +144,14 @@ impl BlockIterator {
         let key_len = entry.get_u16() as usize;
         let key = &entry[..key_len];
         self.key.clear();
-        self.key.append(&self.first_key.raw_ref()[..overlap_len]);
+        self.key.append(&self.first_key.key_ref()[..overlap_len]);
         self.key.append(key);
         entry.advance(key_len);
+        let ts = entry.get_u64();
+        self.key.set_ts(ts);
         let value_len = entry.get_u16() as usize;
-        let value_offset_begin = offset + SIZEOF_U16 + SIZEOF_U16 + key_len + SIZEOF_U16;
+        let value_offset_begin =
+            offset + SIZEOF_U16 + SIZEOF_U16 + std::mem::size_of::<u64>() + key_len + SIZEOF_U16;
         let value_offset_end = value_offset_begin + value_len;
         self.value_range = (value_offset_begin, value_offset_end);
         entry.advance(value_len);
