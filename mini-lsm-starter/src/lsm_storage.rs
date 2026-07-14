@@ -587,18 +587,12 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        let size;
-        {
-            let guard = self.state.read();
-            guard.memtable.put(_key, _value)?;
-            size = guard.memtable.approximate_size();
-        }
-        self.try_freeze(size)
+        self.write_batch(&[WriteBatchRecord::Put(_key, _value)])
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        self.put(_key, b"")
+        self.write_batch(&[WriteBatchRecord::Del(_key)])
     }
 
     fn try_freeze(&self, estimated_size: usize) -> Result<()> {
