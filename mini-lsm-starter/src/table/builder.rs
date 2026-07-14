@@ -167,7 +167,7 @@ impl SsTableBuilder {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts: self.max_ts,
         };
 
         Ok(sstable)

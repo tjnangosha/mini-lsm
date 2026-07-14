@@ -31,6 +31,7 @@ use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::LsmStorageInner,
+    mem_table::map_bound,
 };
 
 pub struct Transaction {
@@ -44,28 +45,54 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        if let Some(entry) = self.local_storage.get(key) {
+            if entry.value().is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(entry.value().clone()));
+        }
+        self.inner.get_with_ts(key, self.read_ts)
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
-        unimplemented!()
+        let mut local_iter = TxnLocalIteratorBuilder {
+            map: self.local_storage.clone(),
+            iter_builder: |map| map.range((map_bound(lower), map_bound(upper))),
+            item: (Bytes::new(), Bytes::new()),
+        }
+        .build();
+        let entry = local_iter.with_iter_mut(|iter| TxnLocalIterator::entry_to_item(iter.next()));
+        local_iter.with_mut(|x| *x.item = entry);
+
+        TxnIterator::create(
+            self.clone(),
+            TwoMergeIterator::create(
+                local_iter,
+                self.inner.scan_with_ts(lower, upper, self.read_ts)?,
+            )?,
+        )
     }
 
+    /// Implement this in a later chapter -- writes still go directly through the engine for now.
     pub fn put(&self, key: &[u8], value: &[u8]) {
         unimplemented!()
     }
 
+    /// Implement this in a later chapter -- writes still go directly through the engine for now.
     pub fn delete(&self, key: &[u8]) {
         unimplemented!()
     }
 
+    /// Implement this in a later chapter -- writes still go directly through the engine for now.
     pub fn commit(&self) -> Result<()> {
         unimplemented!()
     }
 }
 
 impl Drop for Transaction {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        self.inner.mvcc().ts.lock().1.remove_reader(self.read_ts);
+    }
 }
 
 type SkipMapRangeIter<'a> =
@@ -83,23 +110,35 @@ pub struct TxnLocalIterator {
     item: (Bytes, Bytes),
 }
 
+impl TxnLocalIterator {
+    fn entry_to_item(
+        entry: Option<crossbeam_skiplist::map::Entry<'_, Bytes, Bytes>>,
+    ) -> (Bytes, Bytes) {
+        entry
+            .map(|x| (x.key().clone(), x.value().clone()))
+            .unwrap_or_else(|| (Bytes::new(), Bytes::new()))
+    }
+}
+
 impl StorageIterator for TxnLocalIterator {
     type KeyType<'a> = &'a [u8];
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        &self.borrow_item().1[..]
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        &self.borrow_item().0[..]
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.borrow_item().0.is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let entry = self.with_iter_mut(|iter| TxnLocalIterator::entry_to_item(iter.next()));
+        self.with_mut(|x| *x.item = entry);
+        Ok(())
     }
 }
 
@@ -113,7 +152,18 @@ impl TxnIterator {
         txn: Arc<Transaction>,
         iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
-        unimplemented!()
+        let mut iter = Self { _txn: txn, iter };
+        iter.skip_deletes()?;
+        Ok(iter)
+    }
+
+    /// A local-storage tombstone (empty value) marks a key deleted within the transaction; skip
+    /// over those so the iterator only ever surfaces live keys.
+    fn skip_deletes(&mut self) -> Result<()> {
+        while self.iter.is_valid() && self.iter.value().is_empty() {
+            self.iter.next()?;
+        }
+        Ok(())
     }
 }
 
@@ -136,7 +186,9 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.iter.next()?;
+        self.skip_deletes()?;
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {
