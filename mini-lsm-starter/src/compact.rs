@@ -36,7 +36,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -134,10 +134,12 @@ impl LsmStorageInner {
     /// still visible to some reader (ts > watermark) are always kept as-is. For versions at or
     /// below the watermark, only the latest one is kept (older ones can never be observed by any
     /// current or future reader); at the bottom-most level we can drop that latest version too if
-    /// it is itself a delete tombstone, since nothing below it remains to resurrect. We also
-    /// require that every version of a user key lands in the same SST, even if that pushes the
-    /// SST past `target_sst_size`: this keeps the invariant that a key is never split across
-    /// multiple SSTs within a level.
+    /// it is itself a delete tombstone, since nothing below it remains to resurrect. If the latest
+    /// at-or-below-watermark version of a key matches a registered compaction filter, it is
+    /// dropped too, regardless of level -- the user has told us no reader will ever request keys
+    /// in that range. We also require that every version of a user key lands in the same SST,
+    /// even if that pushes the SST past `target_sst_size`: this keeps the invariant that a key is
+    /// never split across multiple SSTs within a level.
     fn compact_generate_sst_from_iter(
         &self,
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
@@ -148,8 +150,9 @@ impl LsmStorageInner {
         let watermark = self.mvcc().watermark();
         let mut last_key = Vec::<u8>::new();
         let mut first_key_below_watermark = false;
+        let compaction_filters = self.compaction_filters.lock().clone();
 
-        while iter.is_valid() {
+        'outer: while iter.is_valid() {
             if builder.is_none() {
                 builder = Some(SsTableBuilder::new(self.options.block_size));
             }
@@ -181,6 +184,16 @@ impl LsmStorageInner {
                     continue;
                 }
                 first_key_below_watermark = false;
+
+                for filter in &compaction_filters {
+                    let CompactionFilter::Prefix(prefix) = filter;
+                    if iter.key().key_ref().starts_with(prefix) {
+                        last_key.clear();
+                        last_key.extend(iter.key().key_ref());
+                        iter.next()?;
+                        continue 'outer;
+                    }
+                }
             }
 
             let builder_inner = builder.as_mut().unwrap();
