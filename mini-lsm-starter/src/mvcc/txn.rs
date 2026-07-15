@@ -18,7 +18,10 @@
 use std::{
     collections::HashSet,
     ops::Bound,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Result;
@@ -30,7 +33,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::LsmStorageInner,
+    lsm_storage::{LsmStorageInner, WriteBatchRecord},
     mem_table::map_bound,
 };
 
@@ -45,6 +48,9 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("cannot operate on committed txn!");
+        }
         if let Some(entry) = self.local_storage.get(key) {
             if entry.value().is_empty() {
                 return Ok(None);
@@ -55,6 +61,9 @@ impl Transaction {
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("cannot operate on committed txn!");
+        }
         let mut local_iter = TxnLocalIteratorBuilder {
             map: self.local_storage.clone(),
             iter_builder: |map| map.range((map_bound(lower), map_bound(upper))),
@@ -73,19 +82,42 @@ impl Transaction {
         )
     }
 
-    /// Implement this in a later chapter -- writes still go directly through the engine for now.
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        unimplemented!()
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("cannot operate on committed txn!");
+        }
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
 
-    /// Implement this in a later chapter -- writes still go directly through the engine for now.
+    /// Deletes are recorded as an empty value; the actual removal happens once the tombstone is
+    /// compacted away.
     pub fn delete(&self, key: &[u8]) {
-        unimplemented!()
+        if self.committed.load(Ordering::SeqCst) {
+            panic!("cannot operate on committed txn!");
+        }
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::new());
     }
 
-    /// Implement this in a later chapter -- writes still go directly through the engine for now.
     pub fn commit(&self) -> Result<()> {
-        unimplemented!()
+        self.committed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .expect("cannot operate on committed txn!");
+        let _commit_lock = self.inner.mvcc().commit_lock.lock();
+        let batch = self
+            .local_storage
+            .iter()
+            .map(|entry| {
+                if entry.value().is_empty() {
+                    WriteBatchRecord::Del(entry.key().clone())
+                } else {
+                    WriteBatchRecord::Put(entry.key().clone(), entry.value().clone())
+                }
+            })
+            .collect::<Vec<_>>();
+        self.inner.write_batch(&batch)?;
+        Ok(())
     }
 }
 

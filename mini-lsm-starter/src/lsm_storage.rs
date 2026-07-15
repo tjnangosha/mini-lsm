@@ -571,34 +571,32 @@ impl LsmStorageInner {
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let _write_lock = self.mvcc().write_lock.lock();
         let ts = self.mvcc().latest_commit_ts() + 1;
+        let mut batch_data: Vec<(KeySlice, &[u8])> = Vec::with_capacity(_batch.len());
         for record in _batch {
             match record {
                 WriteBatchRecord::Del(key) => {
                     let key = key.as_ref();
                     assert!(!key.is_empty(), "key cannot be empty");
-                    let size;
-                    {
-                        let guard = self.state.read();
-                        guard.memtable.put(KeySlice::from_slice(key, ts), b"")?;
-                        size = guard.memtable.approximate_size();
-                    }
-                    self.try_freeze(size)?;
+                    batch_data.push((KeySlice::from_slice(key, ts), b""));
                 }
                 WriteBatchRecord::Put(key, value) => {
                     let key = key.as_ref();
                     let value = value.as_ref();
                     assert!(!key.is_empty(), "key cannot be empty");
                     assert!(!value.is_empty(), "value cannot be empty");
-                    let size;
-                    {
-                        let guard = self.state.read();
-                        guard.memtable.put(KeySlice::from_slice(key, ts), value)?;
-                        size = guard.memtable.approximate_size();
-                    }
-                    self.try_freeze(size)?;
+                    batch_data.push((KeySlice::from_slice(key, ts), value));
                 }
             }
         }
+        // The whole batch must land in one memtable/WAL write, even if it pushes the memtable
+        // past its size limit -- so freeze only after the batch has been applied in full.
+        let size;
+        {
+            let guard = self.state.read();
+            guard.memtable.put_batch(&batch_data)?;
+            size = guard.memtable.approximate_size();
+        }
+        self.try_freeze(size)?;
         self.mvcc().update_commit_ts(ts);
         Ok(())
     }
