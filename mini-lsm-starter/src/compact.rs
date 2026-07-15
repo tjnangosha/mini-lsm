@@ -130,20 +130,24 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    /// With MVCC, keys are timestamped and a single user key may have many versions. We keep ALL
-    /// versions (including tombstones) here -- garbage collecting old/deleted versions requires
-    /// knowing which timestamps are no longer observable by any reader (a watermark), which we
-    /// don't track yet. We do, however, require that every version of a user key lands in the
-    /// same SST, even if that pushes the SST past `target_sst_size`: this keeps the invariant
-    /// that a key is never split across multiple SSTs within a level.
+    /// With MVCC, keys are timestamped and a single user key may have many versions. Versions
+    /// still visible to some reader (ts > watermark) are always kept as-is. For versions at or
+    /// below the watermark, only the latest one is kept (older ones can never be observed by any
+    /// current or future reader); at the bottom-most level we can drop that latest version too if
+    /// it is itself a delete tombstone, since nothing below it remains to resurrect. We also
+    /// require that every version of a user key lands in the same SST, even if that pushes the
+    /// SST past `target_sst_size`: this keeps the invariant that a key is never split across
+    /// multiple SSTs within a level.
     fn compact_generate_sst_from_iter(
         &self,
         mut iter: impl for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>,
-        _compact_to_bottom_level: bool,
+        compact_to_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut builder = None;
         let mut new_sst = Vec::new();
+        let watermark = self.mvcc().watermark();
         let mut last_key = Vec::<u8>::new();
+        let mut first_key_below_watermark = false;
 
         while iter.is_valid() {
             if builder.is_none() {
@@ -151,10 +155,37 @@ impl LsmStorageInner {
             }
 
             let same_as_last_key = iter.key().key_ref() == last_key;
+            if !same_as_last_key {
+                first_key_below_watermark = true;
+            }
 
-            if !same_as_last_key
-                && builder.as_ref().unwrap().estimated_size() >= self.options.target_sst_size
+            if compact_to_bottom_level
+                && !same_as_last_key
+                && iter.key().ts() <= watermark
+                && iter.value().is_empty()
             {
+                // The latest version of this key at or below the watermark is a tombstone, and
+                // this is the bottom level, so the key can be dropped entirely.
+                last_key.clear();
+                last_key.extend(iter.key().key_ref());
+                iter.next()?;
+                first_key_below_watermark = false;
+                continue;
+            }
+
+            if iter.key().ts() <= watermark {
+                if !first_key_below_watermark {
+                    // We already kept the latest at-or-below-watermark version of this key;
+                    // everything older is unreachable by any reader.
+                    iter.next()?;
+                    continue;
+                }
+                first_key_below_watermark = false;
+            }
+
+            let builder_inner = builder.as_mut().unwrap();
+
+            if !same_as_last_key && builder_inner.estimated_size() >= self.options.target_sst_size {
                 let sst_id = self.next_sst_id();
                 let old_builder = builder.take().unwrap();
                 let sst = Arc::new(old_builder.build(
